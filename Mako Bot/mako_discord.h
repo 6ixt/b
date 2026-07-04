@@ -8,36 +8,32 @@
 #include <cstring>
 #include "mako_protect.h"
 
-// ════════════════════════════════════════════════════════
-//  MAKO  —  Discord IPC auth + backend membership check
-// ════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+//  MAKO  â€”  Discord IPC auth + backend membership check
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 namespace MakoDiscord {
 
-// ── Replace these three values ────────────────────────────
-// CLIENT_ID  : Application ID from the Discord dev portal
-// BACKEND    : Railway domain you got after deploying
-// API_KEY    : The random string you set as the API_KEY env var
-static const char* CLIENT_ID() { static auto s = XS("1478189787272843294");        return s.c_str(); }
-static std::wstring BACKEND()  { return WXS(L"your-app.railway.app"); }  // fill after Railway deploy
-static const char* API_KEY()   { static auto s = XS("mk_Fc8Xp2Rz9Nq1Bt5Kj");      return s.c_str(); }
-// ─────────────────────────────────────────────────────────
+static const char*   CLIENT_ID() { static auto s = XS("1517965290829254657");      return s.c_str(); }
+static std::wstring  BACKEND()   { return WXS(L"b-production-f80c.up.railway.app"); }
+static const char*   API_KEY()   { static auto s = XS("mk_Fc8Xp2Rz9Nq1Bt5Kj");    return s.c_str(); }
 
-// IPC frame format: [op:u32le][len:u32le][json:char[len]]
-// Opcode 0 = HANDSHAKE, opcode 1 = FRAME (response)
 static std::string ipc_get_user_id() {
-    // Discord exposes pipes discord-ipc-0 through discord-ipc-9.
-    // Try them all; the active one is whichever Discord instance is running.
     HANDLE pipe = INVALID_HANDLE_VALUE;
+    int found_i = -1;
     for (int i = 0; i < 10 && pipe == INVALID_HANDLE_VALUE; i++) {
         char path[48];
         snprintf(path, sizeof(path), "\\\\.\\pipe\\discord-ipc-%d", i);
         pipe = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                            0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe != INVALID_HANDLE_VALUE) found_i = i;
     }
-    if (pipe == INVALID_HANDLE_VALUE) return {};
+    if (pipe == INVALID_HANDLE_VALUE) {
+        printf("  [ipc] pipe not found (err %lu)\n", GetLastError());
+        return {};
+    }
+    printf("  [ipc] connected to discord-ipc-%d\n", found_i);
 
-    // Build HANDSHAKE frame
     char payload[256];
     int plen = snprintf(payload, sizeof(payload),
                         "{\"v\":1,\"client_id\":\"%s\"}", CLIENT_ID());
@@ -51,56 +47,59 @@ static std::string ipc_get_user_id() {
 
     DWORD written = 0;
     if (!WriteFile(pipe, frame, 8 + plen, &written, nullptr) || written != (DWORD)(8 + plen)) {
+        printf("  [ipc] write failed (err %lu, wrote %lu/%d)\n", GetLastError(), written, 8 + plen);
         CloseHandle(pipe); return {};
     }
+    printf("  [ipc] handshake sent (%d bytes)\n", 8 + plen);
 
-    // Read response header (8 bytes: opcode + payload length)
     uint8_t hdr[8] = {};
     DWORD got = 0;
     if (!ReadFile(pipe, hdr, 8, &got, nullptr) || got < 8) {
+        printf("  [ipc] header read failed (err %lu, got %lu)\n", GetLastError(), got);
         CloseHandle(pipe); return {};
     }
 
     uint32_t resp_op = 0, resp_len = 0;
     memcpy(&resp_op,  hdr,     4);
     memcpy(&resp_len, hdr + 4, 4);
+    printf("  [ipc] response op=%u len=%u\n", resp_op, resp_len);
 
-    // Expect opcode 1 (FRAME) containing the READY event.
-    // Reject anything too large (Discord responses are well under 4KB).
     if (resp_op != 1 || resp_len == 0 || resp_len > 8192) {
+        // Read and print the payload anyway so we can see the error message
+        if (resp_len > 0 && resp_len <= 8192) {
+            std::vector<char> ebuf(resp_len + 1, 0);
+            DWORD er = 0;
+            ReadFile(pipe, ebuf.data(), resp_len, &er, nullptr);
+            printf("  [ipc] discord says: %.*s\n", (int)er, ebuf.data());
+        }
         CloseHandle(pipe); return {};
     }
 
     std::vector<char> buf(resp_len + 1, 0);
     if (!ReadFile(pipe, buf.data(), resp_len, &got, nullptr) || got < resp_len) {
+        printf("  [ipc] payload read failed (err %lu, got %lu/%u)\n", GetLastError(), got, resp_len);
         CloseHandle(pipe); return {};
     }
     CloseHandle(pipe);
+    printf("  [ipc] got payload: %.120s\n", buf.data());
 
-    // Extract user ID from the READY event JSON.
-    // Structure: {"cmd":"DISPATCH","data":{...,"user":{"id":"<snowflake>",...}},"evt":"READY"}
-    // Locate "user": first so we skip any other "id" fields earlier in the JSON
-    // (config section, nonce, etc. — none of which are snowflakes anyway).
     std::string json(buf.data(), resp_len);
     size_t user_pos = json.find("\"user\":");
-    if (user_pos == std::string::npos) return {};
+    if (user_pos == std::string::npos) { printf("  [ipc] no 'user' in json\n"); return {}; }
     size_t id_pos = json.find("\"id\":\"", user_pos);
-    if (id_pos == std::string::npos) return {};
+    if (id_pos == std::string::npos) { printf("  [ipc] no 'id' in user obj\n"); return {}; }
     id_pos += 6;
     size_t id_end = json.find('"', id_pos);
     if (id_end == std::string::npos) return {};
 
     std::string uid = json.substr(id_pos, id_end - id_pos);
+    if (uid.size() < 17 || uid.size() > 19) { printf("  [ipc] bad snowflake: %s\n", uid.c_str()); return {}; }
+    for (char c : uid) if (c < '0' || c > '9') { printf("  [ipc] non-digit in id\n"); return {}; }
 
-    // Validate: Discord snowflakes are 17-19 decimal digits, nothing else.
-    if (uid.size() < 17 || uid.size() > 19) return {};
-    for (char c : uid) if (c < '0' || c > '9') return {};
-
+    printf("  [ipc] user id: %s\n", uid.c_str());
     return uid;
 }
 
-// POST {"user_id":"<id>","key":"<api_key>"} to the backend.
-// Backend calls Discord REST to verify guild membership; returns {"ok":true/false}.
 static bool backend_verify(const std::string& user_id) {
     if (user_id.empty()) return false;
 
@@ -112,7 +111,6 @@ static bool backend_verify(const std::string& user_id) {
                                    WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSess) return false;
 
-    // Keep timeouts tight — the loader stalls here if these are left at defaults.
     DWORD ms = 6000;
     WinHttpSetOption(hSess, WINHTTP_OPTION_CONNECT_TIMEOUT, &ms, sizeof(ms));
     WinHttpSetOption(hSess, WINHTTP_OPTION_SEND_TIMEOUT,    &ms, sizeof(ms));
@@ -168,10 +166,6 @@ static bool backend_verify(const std::string& user_id) {
     return ok;
 }
 
-// ── Public entry point ────────────────────────────────────
-// Blocks until Discord is open, user ID is retrieved, and backend confirms
-// guild membership. Calls ExitProcess if verification fails.
-// Console colour macros (_BLU, _WHT, _GRY, _RST) must be defined at call site.
 #define MAKO_DISCORD_VERIFY() \
     do { \
         printf("\033[2;37m  >> Verifying Discord membership...\033[0m\n"); \
@@ -179,12 +173,10 @@ static bool backend_verify(const std::string& user_id) {
         while (_uid.empty()) { \
             _uid = MakoDiscord::ipc_get_user_id(); \
             if (_uid.empty()) { \
-                printf("\033[97m  Discord not detected. Open Discord and press any key...\033[0m\n"); \
-                while (!_uid.empty() || !(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) { \
+                printf("\033[97m  Discord not detected. Open Discord and try again...\033[0m\n"); \
+                for (int _i = 0; _i < 3; _i++) { \
                     if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) ExitProcess(0); \
-                    Sleep(2000); \
-                    _uid = MakoDiscord::ipc_get_user_id(); \
-                    if (!_uid.empty()) break; \
+                    Sleep(1000); \
                 } \
             } \
         } \
